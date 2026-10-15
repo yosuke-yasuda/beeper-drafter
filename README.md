@@ -1,0 +1,159 @@
+# beeper-drafter
+
+**AI drafts your replies across every chat app. You stay the one who sends.**
+
+## How it works
+
+Message Recieved -> AI in this repo -> Drafted in Beeper (Mobile App)
+
+<img src="doc/demo.gif" alt="Demo: a message arrives on Instagram, beeper-drafter prints its decision in the terminal, and a reply draft appears in Beeper ready to send" width="880">
+
+<sub>A friend messages on Instagram (left). beeper-drafter decides a reply is appropriate (terminal) and puts a draft in the message box. Sending is still up to you.</sub>
+
+## Description
+
+`beeper-drafter` watches your [Beeper](https://www.beeper.com/) inbox (WhatsApp, iMessage, Telegram, Discord, Slack, Signal, Instagram…). When a new message arrives, it asks an AI ([Claude Code](https://claude.com/claude-code) or [OpenAI Codex](https://developers.openai.com/codex/cli)) whether a reply is appropriate and, if so, writes a draft straight into that chat's message box. A few seconds later, the draft is waiting for you in Beeper.
+
+```
+Beeper Desktop ──(new message event)──▶ beeper-drafter ──▶ claude / codex ──▶ draft in Beeper's message box
+                                                                          (you review, edit, press Enter)
+```
+
+- **It never sends anything.** It only fills in the draft box, and only if the box is empty. It never overwrites what you've started typing.
+- **It decides when not to reply.** "Thanks!", notifications, marketing, group chats where you're not addressed, and questions only you can answer are skipped.
+- **Uses the AI subscription you already have.** No API key needed. It runs the `claude` or `codex` CLI you're already logged into (Claude Pro/Max or ChatGPT plan).
+- **Event-driven.** It reacts to Beeper's local WebSocket events, so drafts appear about 4–5 seconds after a message arrives.
+- **No dependencies.** One Node.js script, nothing to `npm install`.
+
+## Requirements
+
+- macOS, Windows, or Linux with [Beeper Desktop](https://www.beeper.com/download) running and signed in
+- [Node.js](https://nodejs.org/) 22.9 or later
+- One of these, logged in:
+  - [Claude Code](https://docs.claude.com/en/docs/claude-code/setup) (`claude` works in your terminal), or
+  - [OpenAI Codex CLI](https://developers.openai.com/codex/cli) (`codex` works in your terminal; sign in with ChatGPT)
+
+## Setup
+
+### 1. Get the code
+
+```sh
+git clone https://github.com/yosuke-yasuda/beeper-drafter.git
+cd beeper-drafter
+```
+
+### 2. Create a Beeper access token
+
+Open Beeper Desktop's settings by clicking your avatar at the bottom-left.
+
+<img src="doc/images/settings.png" alt="Click your avatar at the bottom-left of Beeper Desktop to open Settings" width="560">
+
+Go to **Integrations**. Make sure **Allow connections** at the top is on, then click **⊕** next to **Approved connections**.
+
+<img src="doc/images/token-generation-in-settings.png" alt="Integrations settings, with the + button next to Approved connections" width="560">
+
+Name the token (e.g. `beeper-drafter`) and **turn on "Allow sensitive actions"**. Writing a draft counts as a write, and without this you'll get a `403 … missing: write` error. Click **Create Access Token** and copy it.
+
+<img src="doc/images/draft-active.png" alt="Create a new token dialog, with Allow sensitive actions turned on" width="460">
+
+> The token can read and send messages on all your connected accounts. Treat it like a password: don't paste it into chats or commit it. If it leaks, revoke it in the same screen.
+
+### 3. Configure
+
+```sh
+cp .env.example .env
+cp config/MESSAGE_STYLE.example.md config/MESSAGE_STYLE.md
+```
+
+- Paste your token into `.env` as `BEEPER_TOKEN=...`
+- To use Codex instead of Claude, also set `AI_PROVIDER=codex`.
+- Edit `config/MESSAGE_STYLE.md` to describe who you are and how you write. This is the biggest lever on draft quality.
+
+Both files are gitignored.
+
+### 4. Try it without touching your chats
+
+```sh
+npm run dry-run
+```
+
+You should see `connected to Beeper, listening for messages`, followed by what it would draft for your current unread chats:
+
+```
+connected to Beeper, listening for messages
+draft [Discord] Alex — Sender is asking for help but hasn't said what they need.
+      > Hey! Sure, what's up?
+skip  [Instagram] Shop — Automated marketing message; no reply needed.
+```
+
+Ask a friend to message you, and a new line should appear within a few seconds. Press `Ctrl+C` to stop.
+
+### 5. Run it for real
+
+```sh
+npm start
+```
+
+Drafts now appear in Beeper's message box. Read them, edit if needed, and send them yourself.
+
+## Configuration
+
+Set these in `.env`:
+
+| Variable | Default | What it does |
+|---|---|---|
+| `BEEPER_TOKEN` | — | Required. Your Beeper Desktop API token. |
+| `AI_PROVIDER` | `claude` | `claude` (Claude Code) or `codex` (OpenAI Codex CLI). |
+| `AI_MODEL` | `sonnet` for Claude; Codex's own default | Model name, e.g. `sonnet`, `opus`, `haiku` for Claude, or any model your Codex CLI accepts. |
+| `AI_EFFORT` | the CLI's default | Thinking level. Lower is faster; higher thinks harder before drafting. Claude: `low`, `medium`, `high`, `xhigh`, `max`. Codex: depends on the model (usually `low`…`xhigh`; some also accept `minimal` or `max`). If a level isn't supported, the error says which are. |
+| `DEBOUNCE_SECONDS` | `1.5` | Wait after a message before drafting, so a burst of messages gets one draft. Raise it if people send many short messages in a row. |
+| `RECONCILE_SECONDS` | `600` | How often to re-check the whole inbox, in case an event was missed (Beeper doesn't replay events after a disconnect). |
+| `HISTORY` | `20` | How many recent messages Claude sees. |
+| `BEEPER_URL` | `http://localhost:23373` | Beeper Desktop API address. |
+
+Command-line flags:
+
+- `npm start -- --once`: check the inbox once and exit
+- `npm start -- --dry-run`: print drafts without writing them
+
+## Which chats it looks at
+
+A chat is considered only if it has unread messages, is not muted, archived, low-priority, or read-only, its draft box is empty, and the last message is from someone else. Each message is considered once; `state.json` remembers what's been handled. Delete that file to start fresh.
+
+## Privacy
+
+Everything runs on your machine, and the Beeper API is local-only (keep **Remote Access** off in Beeper's settings). However, **the text of the chats it drafts for is sent to your AI provider** (Anthropic for Claude, OpenAI for Codex), the same as if you pasted it into Claude yourself. Mute or archive chats you don't want it to see, or don't run it on accounts where that isn't OK.
+
+## Speed and cost
+
+It uses whichever CLI you choose, logged in the way it already is. On a Claude Pro/Max or ChatGPT plan, calls count toward that plan's usage limits; there's no separate charge. If an API key is set instead (`ANTHROPIC_API_KEY`, or Codex logged in with an API key), that key is billed. Each call is kept small: no tools, MCP servers, user config, or project rules are loaded.
+
+A draft typically appears 4–6 seconds after a message arrives. Measured on one machine, per AI call: Claude `sonnet` about 4 s, Codex at its default effort about 5–6 s, Codex `low` about 4.5 s. For a live demo, `AI_EFFORT=low` is a good default; raise it if drafts feel shallow.
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `Set BEEPER_TOKEN…` | `.env` is missing or the token line is empty. |
+| `401 … Invalid token` | Token was revoked or expired. Create a new one. |
+| `403 … missing: write` | The token was created without **Allow sensitive actions**. Create a new one with it on. |
+| `disconnected from Beeper, retrying in 5s` repeats | Beeper Desktop isn't running, or **Allow connections** is off in Integrations. |
+| `claude exited 1` / `codex exited 1` | Run `claude` or `codex` once in your terminal and make sure you're logged in. If the message mentions effort, pick one of the levels it lists for `AI_EFFORT`. |
+| `could not start codex` | The Codex CLI isn't installed or isn't on your `PATH`. |
+| A chat never gets a draft | It may be muted, archived, or low-priority, already have a draft, or Claude decided to skip it (the reason is printed). |
+
+## Development
+
+```sh
+npm test
+```
+
+`lib.mjs` holds the pure logic (chat filtering, the prompt, the AI provider commands, and response parsing) and is unit-tested. `drafter.mjs` does the I/O: the Beeper API, the WebSocket, and running the AI CLI. To add another provider, add an entry to `PROVIDERS` in `lib.mjs`.
+
+## License
+
+[MIT](LICENSE)
+
+---
+
+Built by [Yosuke Yasuda](https://github.com/yosuke-yasuda) at [Sharick](https://sharick.ai), where we build an AI that helps you see what matters.

@@ -1,0 +1,6 @@
+.env
+state.json
+config/MESSAGE_STYLE.md
+node_modules/
+.DS_Store
+.tmp

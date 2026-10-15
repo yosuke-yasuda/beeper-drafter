@@ -1,0 +1,16 @@
+{
+  "name": "beeper-drafter",
+  "version": "0.1.0",
+  "description": "Drafts replies to your Beeper messages with Claude Code. Never sends — you review and hit Enter.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.9"
+  },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env drafter.mjs",
+    "dry-run": "node --env-file-if-exists=.env drafter.mjs --dry-run",
+    "test": "node --test"
+  }
+}
