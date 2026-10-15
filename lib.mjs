@@ -1,4 +1,4 @@
-// Pure logic, kept free of I/O so it can be unit-tested without Beeper or Claude.
+// Pure logic, kept free of I/O so it can be unit-tested without Beeper or an AI CLI.
 
 // A chat is worth looking at only if it has unread messages, is in the normal inbox,
 // and has an empty draft box (we never overwrite something you started typing).
@@ -62,7 +62,7 @@ export const PROVIDERS = {
   },
 };
 
-export function resolveProvider({ provider = "claude", model, effort } = {}) {
+export function resolveProvider({ provider = "codex", model, effort } = {}) {
   const p = PROVIDERS[provider];
   if (!p) throw new Error(`AI_PROVIDER must be one of: ${Object.keys(PROVIDERS).join(", ")} (got "${provider}")`);
   // Effort is passed through unvalidated: the accepted levels depend on the model, and the CLI says which.

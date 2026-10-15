@@ -12,16 +12,16 @@ Message Recieved -> AI in this repo -> Drafted in Beeper (Mobile App)
 
 ## Description
 
-`beeper-drafter` watches your [Beeper](https://www.beeper.com/) inbox (WhatsApp, iMessage, Telegram, Discord, Slack, Signal, Instagram…). When a new message arrives, it asks an AI ([Claude Code](https://claude.com/claude-code) or [OpenAI Codex](https://developers.openai.com/codex/cli)) whether a reply is appropriate and, if so, writes a draft straight into that chat's message box. A few seconds later, the draft is waiting for you in Beeper.
+`beeper-drafter` watches your [Beeper](https://www.beeper.com/) inbox (WhatsApp, iMessage, Telegram, Discord, Slack, Signal, Instagram…). When a new message arrives, it asks an AI ([OpenAI Codex](https://developers.openai.com/codex/cli) or [Claude Code](https://claude.com/claude-code)) whether a reply is appropriate and, if so, writes a draft straight into that chat's message box. A few seconds later, the draft is waiting for you in Beeper.
 
 ```
-Beeper Desktop ──(new message event)──▶ beeper-drafter ──▶ claude / codex ──▶ draft in Beeper's message box
+Beeper Desktop ──(new message event)──▶ beeper-drafter ──▶ codex / claude ──▶ draft in Beeper's message box
                                                                           (you review, edit, press Enter)
 ```
 
 - **It never sends anything.** It only fills in the draft box, and only if the box is empty. It never overwrites what you've started typing.
 - **It decides when not to reply.** "Thanks!", notifications, marketing, group chats where you're not addressed, and questions only you can answer are skipped.
-- **Uses the AI subscription you already have.** No API key needed. It runs the `claude` or `codex` CLI you're already logged into (Claude Pro/Max or ChatGPT plan).
+- **Free to run.** Beeper's free plan works, and so does any ChatGPT account, even the free one, through the Codex CLI. Prefer Claude? Claude Code works too, with a Claude Pro/Max plan. No API key needed.
 - **Event-driven.** It reacts to Beeper's local WebSocket events, so drafts appear about 4–5 seconds after a message arrives.
 - **No dependencies.** One Node.js script, nothing to `npm install`.
 
@@ -30,8 +30,8 @@ Beeper Desktop ──(new message event)──▶ beeper-drafter ──▶ claud
 - macOS, Windows, or Linux with [Beeper Desktop](https://www.beeper.com/download) running and signed in
 - [Node.js](https://nodejs.org/) 22.9 or later
 - One of these, logged in:
-  - [Claude Code](https://docs.claude.com/en/docs/claude-code/setup) (`claude` works in your terminal), or
-  - [OpenAI Codex CLI](https://developers.openai.com/codex/cli) (`codex` works in your terminal; sign in with ChatGPT)
+  - [OpenAI Codex CLI](https://developers.openai.com/codex/cli) (default): `npm install -g @openai/codex`, then run `codex` once and sign in with your ChatGPT account (Free or paid), or
+  - [Claude Code](https://docs.claude.com/en/docs/claude-code/setup): needs a Claude Pro/Max plan; `claude` works in your terminal
 
 ## Setup
 
@@ -66,7 +66,7 @@ cp config/MESSAGE_STYLE.example.md config/MESSAGE_STYLE.md
 ```
 
 - Paste your token into `.env` as `BEEPER_TOKEN=...`
-- To use Codex instead of Claude, also set `AI_PROVIDER=codex`.
+- To use Claude Code instead of Codex, also set `AI_PROVIDER=claude`.
 - Edit `config/MESSAGE_STYLE.md` to describe who you are and how you write. This is the biggest lever on draft quality.
 
 Both files are gitignored.
@@ -103,12 +103,12 @@ Set these in `.env`:
 | Variable | Default | What it does |
 |---|---|---|
 | `BEEPER_TOKEN` | — | Required. Your Beeper Desktop API token. |
-| `AI_PROVIDER` | `claude` | `claude` (Claude Code) or `codex` (OpenAI Codex CLI). |
-| `AI_MODEL` | `sonnet` for Claude; Codex's own default | Model name, e.g. `sonnet`, `opus`, `haiku` for Claude, or any model your Codex CLI accepts. |
-| `AI_EFFORT` | the CLI's default | Thinking level. Lower is faster; higher thinks harder before drafting. Claude: `low`, `medium`, `high`, `xhigh`, `max`. Codex: depends on the model (usually `low`…`xhigh`; some also accept `minimal` or `max`). If a level isn't supported, the error says which are. |
+| `AI_PROVIDER` | `codex` | `codex` (OpenAI Codex CLI) or `claude` (Claude Code). |
+| `AI_MODEL` | Codex's own default; `sonnet` for Claude | Any model your Codex CLI accepts, or `sonnet`, `opus`, `haiku` for Claude. |
+| `AI_EFFORT` | the CLI's default | Thinking level. Lower is faster; higher thinks harder before drafting. Codex: depends on the model (usually `low`…`xhigh`; some also accept `minimal` or `max`). Claude: `low`, `medium`, `high`, `xhigh`, `max`. If a level isn't supported, the error says which are. |
 | `DEBOUNCE_SECONDS` | `1.5` | Wait after a message before drafting, so a burst of messages gets one draft. Raise it if people send many short messages in a row. |
 | `RECONCILE_SECONDS` | `600` | How often to re-check the whole inbox, in case an event was missed (Beeper doesn't replay events after a disconnect). |
-| `HISTORY` | `20` | How many recent messages Claude sees. |
+| `HISTORY` | `20` | How many recent messages the AI sees. |
 | `BEEPER_URL` | `http://localhost:23373` | Beeper Desktop API address. |
 
 Command-line flags:
@@ -122,11 +122,11 @@ A chat is considered only if it has unread messages, is not muted, archived, low
 
 ## Privacy
 
-Everything runs on your machine, and the Beeper API is local-only (keep **Remote Access** off in Beeper's settings). However, **the text of the chats it drafts for is sent to your AI provider** (Anthropic for Claude, OpenAI for Codex), the same as if you pasted it into Claude yourself. Mute or archive chats you don't want it to see, or don't run it on accounts where that isn't OK.
+Everything runs on your machine, and the Beeper API is local-only (keep **Remote Access** off in Beeper's settings). However, **the text of the chats it drafts for is sent to your AI provider** (OpenAI for Codex, Anthropic for Claude), the same as if you pasted it into ChatGPT or Claude yourself. Mute or archive chats you don't want it to see, or don't run it on accounts where that isn't OK.
 
 ## Speed and cost
 
-It uses whichever CLI you choose, logged in the way it already is. On a Claude Pro/Max or ChatGPT plan, calls count toward that plan's usage limits; there's no separate charge. If an API key is set instead (`ANTHROPIC_API_KEY`, or Codex logged in with an API key), that key is billed. Each call is kept small: no tools, MCP servers, user config, or project rules are loaded.
+It uses whichever CLI you choose, logged in the way it already is. On a ChatGPT plan (including Free) or a Claude Pro/Max plan, calls count toward that plan's usage limits; there's no separate charge. If an API key is set instead (Codex logged in with an API key, or `ANTHROPIC_API_KEY` for Claude), that key is billed. Each call is kept small: no tools, MCP servers, user config, or project rules are loaded.
 
 A draft typically appears 4–6 seconds after a message arrives. Measured on one machine, per AI call: Claude `sonnet` about 4 s, Codex at its default effort about 5–6 s, Codex `low` about 4.5 s. For a live demo, `AI_EFFORT=low` is a good default; raise it if drafts feel shallow.
 
@@ -138,9 +138,9 @@ A draft typically appears 4–6 seconds after a message arrives. Measured on one
 | `401 … Invalid token` | Token was revoked or expired. Create a new one. |
 | `403 … missing: write` | The token was created without **Allow sensitive actions**. Create a new one with it on. |
 | `disconnected from Beeper, retrying in 5s` repeats | Beeper Desktop isn't running, or **Allow connections** is off in Integrations. |
-| `claude exited 1` / `codex exited 1` | Run `claude` or `codex` once in your terminal and make sure you're logged in. If the message mentions effort, pick one of the levels it lists for `AI_EFFORT`. |
+| `claude exited 1` / `codex exited 1` | Run `codex` or `claude` once in your terminal and make sure you're logged in. If the message mentions effort, pick one of the levels it lists for `AI_EFFORT`. |
 | `could not start codex` | The Codex CLI isn't installed or isn't on your `PATH`. |
-| A chat never gets a draft | It may be muted, archived, or low-priority, already have a draft, or Claude decided to skip it (the reason is printed). |
+| A chat never gets a draft | It may be muted, archived, or low-priority, already have a draft, or the AI decided to skip it (the reason is printed). |
 
 ## Development
 

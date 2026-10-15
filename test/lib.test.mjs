@@ -76,8 +76,12 @@ test("parseVerdict throws on output with no JSON", () => {
   assert.throws(() => parseVerdict("I can't help with that."));
 });
 
+test("codex is the default provider (works with any ChatGPT account, including Free)", () => {
+  assert.equal(resolveProvider().cmd, "codex");
+});
+
 test("claude provider: default model, effort flag, and result extraction", () => {
-  const ai = resolveProvider({ effort: "low" });
+  const ai = resolveProvider({ provider: "claude", effort: "low" });
   assert.equal(ai.cmd, "claude");
   assert.deepEqual(ai.args.slice(ai.args.indexOf("--model"), ai.args.indexOf("--model") + 2), ["--model", "sonnet"]);
   assert.deepEqual(ai.args.slice(-2), ["--effort", "low"]);
