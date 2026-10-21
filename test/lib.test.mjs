@@ -7,6 +7,7 @@ import {
   buildGatePrompt,
   buildPrompt,
   buildSystemOneRequest,
+  describeEvent,
   isCandidate,
   isRecent,
   parseActionDetection,
@@ -20,6 +21,8 @@ import {
   resolveActionAgent,
   resolveProvider,
   resolveSystem1,
+  streaming,
+  toolLabel,
 } from "../lib.mjs";
 
 const chat = { id: "!a", title: "Alex", network: "Discord", type: "single", unreadCount: 1 };
@@ -320,4 +323,46 @@ test("resolveActionAgent: codex keeps your config (MCP servers) and a read-only 
   assert.deepEqual(agent.args.slice(agent.args.indexOf("-s"), agent.args.indexOf("-s") + 2), ["-s", "read-only"]);
   assert.equal(agent.args.at(-1), "-");
   assert.throws(() => resolveActionAgent({ provider: "gemini" }), /ACTION_PROVIDER must be one of/);
+});
+
+test("buildActionPrompt gives the agent the chat's Beeper identifiers, so it can link back to the chat", () => {
+  const beeperChat = { ...chat, id: "!room:beeper.local", accountID: "instagramgo.1", localChatID: "1060", network: "Instagram" };
+  const prompt = buildActionPrompt(rules, { action: "x", details: "" }, beeperChat, []);
+  assert.match(prompt, /Chat ID \(Matrix room ID\): !room:beeper\.local/);
+  assert.match(prompt, /Account ID: instagramgo\.1/);
+  assert.match(prompt, /Local chat ID: 1060/);
+  assert.doesNotMatch(buildActionPrompt(rules, { action: "x", details: "" }, chat, []), /Account ID/);
+});
+
+test("streaming(claude) asks for stream-json and still extracts the result, including denied tools", () => {
+  const agent = streaming(resolveActionAgent({ provider: "claude", tools: ["all"] }));
+  assert.deepEqual(agent.args.slice(agent.args.indexOf("--output-format"), agent.args.indexOf("--output-format") + 3), ["--output-format", "stream-json", "--verbose"]);
+  const stdout = [
+    JSON.stringify({ type: "system", subtype: "init", model: "sonnet", tools: [] }),
+    JSON.stringify({ type: "result", result: "Done.", permission_denials: [{ tool_name: "mcp__gmail__send" }] }),
+    "",
+  ].join("\n");
+  assert.match(agent.extractText(stdout), /^Done\.\n\(denied tools: mcp__gmail__send/);
+});
+
+test("streaming(codex) adds --json and extracts the last agent message", () => {
+  const agent = streaming(resolveActionAgent({ provider: "codex" }));
+  assert.deepEqual(agent.args.slice(0, 2), ["exec", "--json"]);
+  assert.equal(agent.args.at(-1), "-");
+  const event = (text) => JSON.stringify({ type: "item.completed", item: { type: "agent_message", text } });
+  assert.equal(agent.extractText([event("Working on it"), event("Created the event.")].join("\n")), "Created the event.");
+});
+
+test("describeEvent shows tool calls, their results, and messages, one line each", () => {
+  const claude = (content, type = "assistant") => JSON.stringify({ type, message: { content } });
+  assert.deepEqual(describeEvent("claude", claude([{ type: "tool_use", name: "mcp__claude_ai_Google_Calendar__create_event", input: { title: "Call" } }])), ['→ Google_Calendar.create_event {"title":"Call"}']);
+  assert.deepEqual(describeEvent("claude", claude([{ type: "tool_result", is_error: true, content: [{ type: "text", text: "nope" }] }], "user")), ["✗ nope"]);
+  assert.deepEqual(describeEvent("claude", claude([{ type: "text", text: "All\ndone" }])), ["💬 All done"]);
+  assert.deepEqual(describeEvent("claude", JSON.stringify({ type: "rate_limit_event" })), []);
+  assert.deepEqual(describeEvent("claude", "not json"), []);
+  assert.deepEqual(describeEvent("codex", JSON.stringify({ type: "item.started", item: { type: "mcp_tool_call", server: "cal", tool: "create", arguments: { a: 1 } } })), ['→ cal.create {"a":1}']);
+  assert.equal(describeEvent("claude", claude([{ type: "text", text: "x".repeat(500) }]))[0].length, 163);
+  assert.equal(toolLabel("mcp__sharick__notify_me"), "sharick.notify_me");
+  assert.deepEqual(describeEvent("claude", claude([{ type: "tool_use", name: "ToolSearch", input: { query: "select:mcp__sharick__notify_me" } }])), ["🔎 looking up tools: sharick.notify_me"]);
+  assert.deepEqual(describeEvent("claude", claude([{ type: "tool_result", content: [{ type: "tool_reference" }] }], "user")), []);
 });

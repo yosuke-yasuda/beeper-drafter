@@ -260,6 +260,18 @@ export function parseActionDetection(text) {
   };
 }
 
+// Beeper's own identifiers for the chat, so the agent can link back to it (e.g. a beeper:// deep link, if
+// my rules say how to build one). Only fields Beeper actually returned are listed.
+const describeBeeperChat = (chat) => {
+  const ids = [
+    ["Chat ID (Matrix room ID)", chat.id],
+    ["Account ID", chat.accountID],
+    ["Local chat ID", chat.localChatID],
+    ["Network", chat.network],
+  ].filter(([, v]) => v != null && v !== "");
+  return `Beeper chat identifiers:\n${ids.map(([k, v]) => `- ${k}: ${v}`).join("\n")}`;
+};
+
 const unfence = (text) => text.replace(/<\/?(conversation|detected)>/gi, "(tag removed)");
 
 export function buildActionPrompt(instructions, detected, chat, messages, timeZone) {
@@ -275,6 +287,7 @@ ${unfence(`Action: ${detected.action}\nDetails: ${detected.details || "(none)"}`
 </detected>
 
 Chat: ${describeChat(chat)}
+${describeBeeperChat(chat)}
 <conversation>
 ${unfence(formatTranscript(messages))}
 </conversation>
@@ -336,4 +349,85 @@ export function resolveActionAgent({ provider = "codex", model, effort, tools = 
     };
   }
   throw new Error(`ACTION_PROVIDER must be one of: ${Object.keys(PROVIDERS).join(", ")} (got "${provider}")`);
+}
+
+// --- Live view (-v): stream what an agent is doing, one line per step, for watching it work ---
+
+const oneLine = (value, max = 160) => {
+  const s = (typeof value === "string" ? value : JSON.stringify(value) ?? "").replace(/\s+/g, " ").trim();
+  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+};
+
+// "mcp__claude_ai_Google_Calendar__create_event" -> "Google_Calendar.create_event"
+export const toolLabel = (name) => String(name).replace(/^mcp__(claude_ai_)?/, "").replace(/__/g, ".");
+
+const toolResultText = (content) =>
+  Array.isArray(content) ? content.map((c) => c.text ?? `(${c.type})`).join(" ") : content;
+
+// Turns one line of a CLI's JSON event stream into display lines (none for events not worth showing).
+export function describeEvent(cmd, line) {
+  let e;
+  try {
+    e = JSON.parse(line);
+  } catch {
+    return [];
+  }
+  if (cmd === "claude") {
+    if (e.type === "system" && e.subtype === "init") return [`started (${e.model}, ${e.tools?.length ?? 0} tools available)`];
+    const content = e.message?.content;
+    if (!Array.isArray(content)) return [];
+    return content.flatMap((c) => {
+      if (c.type === "text" && c.text.trim()) return [`💬 ${oneLine(c.text)}`];
+      if (c.type === "thinking" && c.thinking?.trim()) return [`💭 ${oneLine(c.thinking)}`];
+      // Claude loads MCP tool schemas on demand with ToolSearch; show that plainly, and skip its bare result.
+      if (c.type === "tool_use" && c.name === "ToolSearch") return [`🔎 looking up tools: ${oneLine(String(c.input?.query ?? "").replace(/^select:/, "").split(",").map(toolLabel).join(", "))}`];
+      if (c.type === "tool_use") return [`→ ${toolLabel(c.name)} ${oneLine(c.input)}`];
+      if (c.type === "tool_result" && Array.isArray(c.content) && c.content.every((x) => x.type === "tool_reference")) return [];
+      if (c.type === "tool_result") return [`${c.is_error ? "✗" : "←"} ${oneLine(toolResultText(c.content))}`];
+      return [];
+    });
+  }
+  if (cmd === "codex") {
+    const item = e.item;
+    if (!item) return [];
+    if (e.type === "item.started" && item.type === "mcp_tool_call") return [`→ ${item.server}.${item.tool} ${oneLine(item.arguments)}`];
+    if (e.type === "item.started" && item.type === "command_execution") return [`→ $ ${oneLine(item.command)}`];
+    if (e.type !== "item.completed") return [];
+    if (item.type === "agent_message") return [`💬 ${oneLine(item.text)}`];
+    if (item.type === "reasoning" && item.text?.trim()) return [`💭 ${oneLine(item.text)}`];
+    if (item.type === "mcp_tool_call") {
+      return [item.error ? `✗ ${oneLine(item.error.message ?? item.error)}` : `← ${oneLine(toolResultText(item.result?.content ?? item.result))}`];
+    }
+    if (item.type === "command_execution") return [`${item.exit_code === 0 ? "←" : "✗"} ${oneLine(item.aggregated_output)}`];
+  }
+  return [];
+}
+
+// The same CLI call, but emitting a JSON event per step, so -v can show it live. extractText still returns
+// what the non-streaming call would: it hands the provider's own extractText the equivalent output.
+export function streaming(provider) {
+  if (provider.cmd === "claude") {
+    const i = provider.args.indexOf("--output-format");
+    return {
+      ...provider,
+      args: [...provider.args.slice(0, i), "--output-format", "stream-json", "--verbose", ...provider.args.slice(i + 2)],
+      extractText: (stdout) => {
+        const result = stdout.split("\n").reverse().find((l) => l.startsWith("{") && JSON.parse(l).type === "result");
+        if (!result) throw new Error("no result event in claude output");
+        return provider.extractText(result);
+      },
+    };
+  }
+  if (provider.cmd === "codex") {
+    return {
+      ...provider,
+      args: [provider.args[0], "--json", ...provider.args.slice(1)],
+      extractText: (stdout) => {
+        const messages = stdout.split("\n").filter((l) => l.startsWith("{")).map((l) => JSON.parse(l))
+          .filter((e) => e.type === "item.completed" && e.item?.type === "agent_message");
+        return provider.extractText(messages.at(-1)?.item.text ?? "");
+      },
+    };
+  }
+  return provider;
 }

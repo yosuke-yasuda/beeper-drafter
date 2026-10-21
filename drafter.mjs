@@ -8,6 +8,7 @@
 //   npm start                  # event-driven (WebSocket), with a slow reconcile poll
 //   npm start -- --once        # one pass over the inbox, then exit
 //   npm start -- --dry-run     # print drafts, don't write them
+//   npm start -- -v            # also show each step live, including every tool call an action agent makes
 
 import { spawn } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
@@ -20,6 +21,7 @@ import {
   buildGatePrompt,
   buildPrompt,
   buildSystemOneRequest,
+  describeEvent,
   GATE_SYSTEM_PROMPT,
   isCandidate,
   isRecent,
@@ -33,6 +35,7 @@ import {
   resolveActionAgent,
   resolveProvider,
   resolveSystem1,
+  streaming,
 } from "./lib.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -43,6 +46,7 @@ const DEBOUNCE_MS = Number(process.env.DEBOUNCE_SECONDS ?? 1.5) * 1000; // wait 
 const HISTORY = Number(process.env.HISTORY ?? 20);
 const ONCE = process.argv.includes("--once");
 const DRY = process.argv.includes("--dry-run");
+const VERBOSE = process.argv.includes("-v") || process.argv.includes("--verbose");
 const STATE_FILE = join(HERE, "state.json");
 // Your personal style file is gitignored; the example is used until you create one.
 const STYLE_FILE = [join(HERE, "config/MESSAGE_STYLE.md"), join(HERE, "config/MESSAGE_STYLE.example.md")].find(existsSync);
@@ -84,6 +88,9 @@ const state = existsSync(STATE_FILE) ? JSON.parse(readFileSync(STATE_FILE, "utf8
 const saveState = () => writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 const style = STYLE_FILE ? readFileSync(STYLE_FILE, "utf8") : "";
 
+// -v: a dim, indented line per step, so you can watch what the AI is doing as it happens.
+const step = VERBOSE ? (text) => console.log(`\x1b[2m      · ${text}\x1b[0m`) : () => {};
+
 async function api(method, path, body) {
   const res = await fetch(BASE + path, {
     method,
@@ -95,12 +102,20 @@ async function api(method, path, body) {
 }
 
 // Runs a provider CLI with the prompt on stdin and resolves with its reply text.
-function runCli(provider, prompt, timeoutMs) {
+// With onLine, the CLI is asked for a JSON event stream and each line is passed to onLine as it arrives.
+function runCli(provider, prompt, timeoutMs, onLine) {
+  if (onLine) provider = streaming(provider);
   return new Promise((resolve, reject) => {
     const p = spawn(provider.cmd, provider.args, { cwd: HERE, stdio: ["pipe", "pipe", "pipe"] });
     const timer = timeoutMs && setTimeout(() => p.kill(), timeoutMs);
-    let out = "", err = "";
-    p.stdout.on("data", (d) => (out += d));
+    let out = "", err = "", pending = "";
+    p.stdout.on("data", (d) => {
+      out += d;
+      if (!onLine) return;
+      const lines = (pending + d).split("\n");
+      pending = lines.pop();
+      for (const line of lines) if (line.trim()) onLine(line);
+    });
     p.stderr.on("data", (d) => (err += d));
     p.on("error", (e) => reject(new Error(`could not start ${provider.cmd}: ${e.message}`)));
     p.on("close", (code, signal) => {
@@ -111,7 +126,11 @@ function runCli(provider, prompt, timeoutMs) {
         const apiError = err.match(/"message":"([^"]+)"/)?.[1];
         return reject(new Error(`${provider.cmd} exited ${code}: ${apiError ?? err.slice(-500)}`));
       }
-      resolve(provider.extractText(out));
+      try {
+        resolve(provider.extractText(out));
+      } catch (e) {
+        reject(new Error(`could not read ${provider.cmd} output: ${e.message}`));
+      }
     });
     p.stdin.end(prompt);
   });
@@ -172,8 +191,10 @@ async function handleChat(chat, messages) {
   };
   const tag = `[${chat.network}] ${chat.title}`;
 
+  step(`${tag} — new message from ${last.senderName ?? "them"}`);
   if (system1) {
     try {
+      step(`System 1 (${system1.name}): does this need a reply?`);
       const gate = await runSystem1(chat, messages, REPLY_QUESTIONS);
       if (gate.probabilities.needs_reply < system1.threshold) {
         console.log(`skip1 ${tag} — ${formatProbabilities(gate.probabilities)} ${gate.reason}`);
@@ -185,13 +206,17 @@ async function handleChat(chat, messages) {
     }
   }
 
+  step(`${ai.name}: reading the last ${messages.length} messages, deciding whether to reply and drafting…`);
   const verdict = await runModel(buildPrompt(chat, messages, style));
   if (!verdict.shouldDraft) {
     console.log(`skip  ${tag} — ${verdict.reason}`);
     return markDone();
   }
   console.log(`draft ${tag} — ${verdict.reason}\n      > ${verdict.draft.replace(/\n/g, "\n      > ")}`);
-  if (!DRY) await api("PATCH", `/v1/chats/${encodeURIComponent(chat.id)}`, { draft: { text: verdict.draft } });
+  if (!DRY) {
+    await api("PATCH", `/v1/chats/${encodeURIComponent(chat.id)}`, { draft: { text: verdict.draft } });
+    step("draft written to Beeper's message box");
+  }
   markDone(); // only after a successful write, so a failed draft is retried
 }
 
@@ -210,8 +235,10 @@ async function handleActions(chat, messages) {
   if (!isRecent(last, Date.now(), ACTION_MAX_AGE_MS)) return markDone();
   const tag = `[${chat.network}] ${chat.title}`;
 
+  step(`${tag} — you sent a message, checking it against your action rules`);
   if (system1) {
     try {
+      step(`System 1 (${system1.name}): does it call for an action?`);
       const gate = await runSystem1(chat, messages, actionQuestions(actionRules));
       if (gate.probabilities.action < system1.threshold) {
         console.log(`skip1 ${tag} — your message: ${formatProbabilities(gate.probabilities)}`);
@@ -222,6 +249,7 @@ async function handleActions(chat, messages) {
     }
   }
 
+  step(`${ai.name}: does your message commit to something your rules cover?`);
   const detectOut = await runCli(ai, buildActionDetectPrompt(chat, messages, actionRules, TIME_ZONE), DETECT_TIMEOUT_MS);
   let detected;
   try {
@@ -235,7 +263,9 @@ async function handleActions(chat, messages) {
   console.log(`act   ${tag} — your message: ${detected.action}${detected.details ? ` (${detected.details})` : ""}`);
   if (DRY) return console.log("      (dry run: agent not started)");
   try {
-    const out = await runCli(actionAgent, buildActionPrompt(actionRules, detected, chat, messages, TIME_ZONE), ACTION_TIMEOUT_MS);
+    step(`${actionAgent.name} agent: starting`);
+    const onLine = VERBOSE ? (line) => describeEvent(actionAgent.cmd, line).forEach(step) : undefined;
+    const out = await runCli(actionAgent, buildActionPrompt(actionRules, detected, chat, messages, TIME_ZONE), ACTION_TIMEOUT_MS, onLine);
     console.log(`      > ${out.trim().slice(0, 500).replace(/\n/g, "\n      > ")}`);
   } catch (e) {
     console.error(`action error ${tag}: ${e.message}`);
