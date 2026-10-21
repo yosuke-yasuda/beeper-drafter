@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // Beeper -> [optional System 1 gate] -> local AI CLI (Claude Code or Codex) -> draft reply back into Beeper.
 // Never sends. Only fills the chat's draft box when it is empty, so you review and hit Enter yourself.
+// Opt-in actions (ACTIONS_ENABLED=true, free-text rules in config/ACTIONS.md): when YOU send a message your
+// rules cover (e.g. you confirm a meeting time), an AI agent carries them out with the tools you allow.
 //
 // Usage (see README):
 //   npm start                  # event-driven (WebSocket), with a slow reconcile poll
@@ -12,15 +14,23 @@ import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  actionQuestions,
+  buildActionDetectPrompt,
+  buildActionPrompt,
   buildGatePrompt,
   buildPrompt,
   buildSystemOneRequest,
   GATE_SYSTEM_PROMPT,
   isCandidate,
+  isRecent,
+  parseActionDetection,
   parseGateVerdict,
-  parseSystemOneAnswer,
+  parseSystemOneAnswers,
+  parseToolList,
   parseVerdict,
   recentMessages,
+  REPLY_QUESTIONS,
+  resolveActionAgent,
   resolveProvider,
   resolveSystem1,
 } from "./lib.mjs";
@@ -36,16 +46,35 @@ const DRY = process.argv.includes("--dry-run");
 const STATE_FILE = join(HERE, "state.json");
 // Your personal style file is gitignored; the example is used until you create one.
 const STYLE_FILE = [join(HERE, "config/MESSAGE_STYLE.md"), join(HERE, "config/MESSAGE_STYLE.example.md")].find(existsSync);
+// Actions are opt-in: ACTIONS_ENABLED=true, and only your own (gitignored) rules file is read, never the example.
+const ACTIONS_ENABLED = process.env.ACTIONS_ENABLED === "true";
+const ACTIONS_FILE = join(HERE, "config/ACTIONS.md");
+const ACTION_MAX_AGE_MS = Number(process.env.ACTION_MAX_AGE_MINUTES ?? 15) * 60 * 1000;
+const DETECT_TIMEOUT_MS = 120 * 1000;
+const TIME_ZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
+const ACTION_TIMEOUT_MS = Number(process.env.ACTION_TIMEOUT_SECONDS ?? 300) * 1000;
 
 if (!TOKEN) {
   console.error("Set BEEPER_TOKEN in .env (see README: Beeper Desktop > Settings > Integrations > Approved connections > +).");
   process.exit(1);
 }
 
-let ai, system1;
+let ai, system1, actionAgent;
+let actionRules = ""; // non-empty only when actions are on
 try {
   ai = resolveProvider({ provider: process.env.AI_PROVIDER, model: process.env.AI_MODEL, effort: process.env.AI_EFFORT });
   system1 = resolveSystem1(process.env);
+  if (ACTIONS_ENABLED) {
+    if (!existsSync(ACTIONS_FILE)) throw new Error(`ACTIONS_ENABLED=true but ${ACTIONS_FILE} is missing. Copy config/ACTIONS.example.md there and edit it.`);
+    actionRules = readFileSync(ACTIONS_FILE, "utf8").trim();
+    if (!actionRules) throw new Error(`ACTIONS_ENABLED=true but ${ACTIONS_FILE} is empty.`);
+    actionAgent = resolveActionAgent({
+      provider: process.env.ACTION_PROVIDER ?? process.env.AI_PROVIDER,
+      model: process.env.ACTION_MODEL,
+      effort: process.env.ACTION_EFFORT,
+      tools: parseToolList(process.env.ACTION_TOOLS),
+    });
+  }
 } catch (e) {
   console.error(e.message);
   process.exit(1);
@@ -66,14 +95,17 @@ async function api(method, path, body) {
 }
 
 // Runs a provider CLI with the prompt on stdin and resolves with its reply text.
-function runCli(provider, prompt) {
+function runCli(provider, prompt, timeoutMs) {
   return new Promise((resolve, reject) => {
     const p = spawn(provider.cmd, provider.args, { cwd: HERE, stdio: ["pipe", "pipe", "pipe"] });
+    const timer = timeoutMs && setTimeout(() => p.kill(), timeoutMs);
     let out = "", err = "";
     p.stdout.on("data", (d) => (out += d));
     p.stderr.on("data", (d) => (err += d));
     p.on("error", (e) => reject(new Error(`could not start ${provider.cmd}: ${e.message}`)));
-    p.on("close", (code) => {
+    p.on("close", (code, signal) => {
+      clearTimeout(timer);
+      if (signal) return reject(new Error(`${provider.cmd} stopped (${signal}) after ${timeoutMs / 1000}s`));
       if (code !== 0) {
         // Surface the API's own message (e.g. an unsupported AI_EFFORT for this model) instead of the raw log tail.
         const apiError = err.match(/"message":"([^"]+)"/)?.[1];
@@ -105,28 +137,31 @@ async function postJson(url, body) {
   return res.json();
 }
 
-// System 1: how likely is it that this chat needs a reply from me? Returns {probability, reason}.
-async function runSystem1(chat, messages) {
+// System 1: asks fast yes/no questions ({id: question}) about the chat. Returns {probabilities: {id: p}, reason}.
+async function runSystem1(chat, messages, questions) {
+  messages = messages.slice(-system1.history); // the gate sees fewer messages, for speed
+  const ids = Object.keys(questions);
   if (system1.kind === "systemone") {
-    const body = await postJson(system1.url, buildSystemOneRequest(system1.model, chat, messages));
-    return { probability: parseSystemOneAnswer(body), reason: system1.model };
+    const body = await postJson(system1.url, buildSystemOneRequest(system1.model, chat, messages, questions));
+    return { probabilities: parseSystemOneAnswers(body, ids), reason: system1.model };
   }
   if (system1.kind === "openai") {
     const body = await postJson(system1.url, {
       model: system1.model,
       messages: [
         { role: "system", content: GATE_SYSTEM_PROMPT },
-        { role: "user", content: buildGatePrompt(chat, messages) },
+        { role: "user", content: buildGatePrompt(chat, messages, questions) },
       ],
     });
-    return parseGateVerdict(body.choices?.[0]?.message?.content ?? "");
+    return parseGateVerdict(body.choices?.[0]?.message?.content ?? "", ids);
   }
-  return parseGateVerdict(await runCli(system1, buildGatePrompt(chat, messages)));
+  return parseGateVerdict(await runCli(system1, buildGatePrompt(chat, messages, questions)), ids);
 }
 
-async function handleChat(chat) {
-  const page = await api("GET", `/v1/chats/${encodeURIComponent(chat.id)}/messages`);
-  const messages = recentMessages(page.items ?? [], HISTORY);
+const formatProbabilities = (probabilities) =>
+  Object.entries(probabilities).map(([id, p]) => `${id} p=${p.toFixed(2)}`).join(", ");
+
+async function handleChat(chat, messages) {
   const last = messages.at(-1);
   if (!last || last.isSender) return;
   if (state[chat.id] === last.sortKey) return; // already considered this message
@@ -139,9 +174,9 @@ async function handleChat(chat) {
 
   if (system1) {
     try {
-      const gate = await runSystem1(chat, messages.slice(-system1.history)); // the gate sees fewer messages, for speed
-      if (gate.probability < system1.threshold) {
-        console.log(`skip1 ${tag} — p=${gate.probability.toFixed(2)} ${gate.reason}`);
+      const gate = await runSystem1(chat, messages, REPLY_QUESTIONS);
+      if (gate.probabilities.needs_reply < system1.threshold) {
+        console.log(`skip1 ${tag} — ${formatProbabilities(gate.probabilities)} ${gate.reason}`);
         return markDone();
       }
     } catch (e) {
@@ -160,14 +195,66 @@ async function handleChat(chat) {
   markDone(); // only after a successful write, so a failed draft is retried
 }
 
+// When the latest message is one I just sent, checks it against my action rules and, if it explicitly calls
+// for one, runs the agent. At most once per message: an action may have side effects, so it is never retried.
+async function handleActions(chat, messages) {
+  const last = messages.at(-1);
+  if (!last?.isSender) return; // only my own sent messages trigger actions
+  const key = `action:${chat.id}`;
+  if (state[key] === last.sortKey) return; // already considered this message
+  const markDone = () => {
+    if (DRY) return; // a dry run must not use up the real run's one chance to act on this message
+    state[key] = last.sortKey;
+    saveState();
+  };
+  if (!isRecent(last, Date.now(), ACTION_MAX_AGE_MS)) return markDone();
+  const tag = `[${chat.network}] ${chat.title}`;
+
+  if (system1) {
+    try {
+      const gate = await runSystem1(chat, messages, actionQuestions(actionRules));
+      if (gate.probabilities.action < system1.threshold) {
+        console.log(`skip1 ${tag} — your message: ${formatProbabilities(gate.probabilities)}`);
+        return markDone();
+      }
+    } catch (e) {
+      console.error(`system1 error ${tag}: ${e.message} (falling back to the full model)`);
+    }
+  }
+
+  const detectOut = await runCli(ai, buildActionDetectPrompt(chat, messages, actionRules, TIME_ZONE), DETECT_TIMEOUT_MS);
+  let detected;
+  try {
+    detected = parseActionDetection(detectOut);
+  } catch {
+    throw new Error(`could not parse ${ai.cmd} action detection: ${detectOut.slice(0, 500)}`);
+  }
+  markDone();
+  if (!detected.triggered) return console.log(`check ${tag} — your message: no action (${detected.reason || "no reason given"})`);
+
+  console.log(`act   ${tag} — your message: ${detected.action}${detected.details ? ` (${detected.details})` : ""}`);
+  if (DRY) return console.log("      (dry run: agent not started)");
+  try {
+    const out = await runCli(actionAgent, buildActionPrompt(actionRules, detected, chat, messages, TIME_ZONE), ACTION_TIMEOUT_MS);
+    console.log(`      > ${out.trim().slice(0, 500).replace(/\n/g, "\n      > ")}`);
+  } catch (e) {
+    console.error(`action error ${tag}: ${e.message}`);
+  }
+}
+
 // Serialize work so two events never draft the same chat concurrently.
 let queue = Promise.resolve();
 const enqueue = (fn) => (queue = queue.then(fn).catch((e) => console.error(e.message)));
 
 async function processChat(chat) {
-  if (!isCandidate(chat)) return;
+  const wantDraft = isCandidate(chat);
+  const wantActions = Boolean(actionRules) && !chat.isReadOnly;
+  if (!wantDraft && !wantActions) return;
   try {
-    await handleChat(chat);
+    const page = await api("GET", `/v1/chats/${encodeURIComponent(chat.id)}/messages`);
+    const messages = recentMessages(page.items ?? [], HISTORY);
+    if (wantActions) await handleActions(chat, messages);
+    if (wantDraft) await handleChat(chat, messages);
   } catch (e) {
     console.error(`error ${chat.title}: ${e.message}`);
   }
@@ -205,11 +292,22 @@ function connect() {
       console.error("ws error:", JSON.stringify(msg));
     }
   };
-  ws.onclose = () => {
+  ws.onclose = async () => {
+    // The WebSocket doesn't say why it closed, so ask over HTTP: a rejected token won't fix itself by retrying.
+    const res = await fetch(`${BASE}/v1/chats?limit=1`, { headers: { Authorization: `Bearer ${TOKEN}` } }).catch(() => null);
+    if (res?.status === 401 || res?.status === 403) {
+      console.error(`Beeper rejected BEEPER_TOKEN (${res.status} ${res.statusText}). Create a new token (see README) and restart.`);
+      process.exit(1);
+    }
     console.error("disconnected from Beeper, retrying in 5s");
     setTimeout(connect, 5000);
   };
   ws.onerror = () => {}; // onclose handles retry
+}
+
+if (actionRules) {
+  console.log(`ACTIONS ON${DRY ? " (dry run: the agent won't start)" : ""}: when YOU send a message that commits to something (e.g. confirming a meeting time), a ${actionAgent.name} agent acts on it following ${ACTIONS_FILE}.`);
+  console.log(`  tools it may use: ${actionAgent.toolScope}`);
 }
 
 if (ONCE) {
