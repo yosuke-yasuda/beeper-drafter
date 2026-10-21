@@ -111,6 +111,30 @@ Set these in `.env`:
 | `HISTORY` | `20` | How many recent messages the AI sees. |
 | `BEEPER_URL` | `http://localhost:23373` | Beeper Desktop API address. |
 
+### Optional: a fast System 1 gate
+
+By default the full model (System 2) reads every candidate chat and decides both whether to reply and what to say. You can put a fast, cheap model in front of it to answer one question first: *does this chat need a reply from me?* Chats it scores below `SYSTEM1_THRESHOLD` are skipped and never reach the full model. Everything else goes to the full model as usual, which can still skip it. If the gate errors or times out, the chat goes to the full model, so a broken gate never costs you a draft.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `SYSTEM1_PROVIDER` | off | `systemone`: a [Clef](https://huggingface.co/Cloudflare/clef-flash) / Jev / SystemOne-compatible server, local or remote. `openai`: any OpenAI-compatible chat API (OpenAI, Ollama, LM Studio). `codex` / `claude`: the CLI with a light model. |
+| `SYSTEM1_URL` | `http://localhost:30000` (systemone), `https://api.openai.com/v1` (openai) | Server base URL. |
+| `SYSTEM1_MODEL` | `Cloudflare/clef-flash` (systemone), `haiku` (claude) | Required for `openai`. |
+| `SYSTEM1_API_KEY` | — | Bearer token for a remote server. `openai` also reads `OPENAI_API_KEY`. |
+| `SYSTEM1_EFFORT` | the CLI's default | `codex` / `claude` only. |
+| `SYSTEM1_THRESHOLD` | `0.3` | Skip when the probability that a reply is needed is below this. Lower skips less. |
+| `SYSTEM1_HISTORY` | `10` | How many recent messages the gate sees. Kept separate from `HISTORY` (the full model's) because the gate only needs the latest exchange, and a shorter input is faster. |
+| `SYSTEM1_TIMEOUT_SECONDS` | `15` | After this, give up on the gate and use the full model. |
+
+Gate skips are logged as `skip1 … p=0.04`. For a free, local gate, serve Clef-Flash (9B) yourself. On a Mac, use llama.cpp (Homebrew `llama.cpp` 0.7.0 or later) with a quantized build; the 4-bit one is 6.5 GB and fits comfortably in 24 GB of memory:
+
+```sh
+brew install llama.cpp
+llama-server -hf ggml-org/Clef-Flash-GGUF:Q4_K_M --port 30000 -c 8192 -b 8192 -ub 8192
+```
+
+Clef reads the whole chat in one batch, so the batch sizes (`-b`, `-ub`) must be at least as large as the prompt; llama-server's default of 512 fails with "input is too large to process". Ollama can't serve it: it only offers chat, and Clef answers only through `/v1/systemone`. On an NVIDIA GPU, SGLang or vLLM also work. Text sent to a local server stays on your machine; text sent to a remote or `openai` gate goes to that provider.
+
 Command-line flags:
 
 - `npm start -- --once`: check the inbox once and exit
@@ -140,7 +164,8 @@ A draft typically appears 4–6 seconds after a message arrives. Measured on one
 | `disconnected from Beeper, retrying in 5s` repeats | Beeper Desktop isn't running, or **Allow connections** is off in Integrations. |
 | `claude exited 1` / `codex exited 1` | Run `codex` or `claude` once in your terminal and make sure you're logged in. If the message mentions effort, pick one of the levels it lists for `AI_EFFORT`. |
 | `could not start codex` | The Codex CLI isn't installed or isn't on your `PATH`. |
-| A chat never gets a draft | It may be muted, archived, or low-priority, already have a draft, or the AI decided to skip it (the reason is printed). |
+| A chat never gets a draft | It may be muted, archived, or low-priority, already have a draft, or the AI decided to skip it (the reason is printed). `skip1` means the System 1 gate skipped it; lower `SYSTEM1_THRESHOLD` if it skips too much. |
+| `system1 error …` | The gate is unreachable or returned something unexpected. The chat still went to the full model. Check that the server at `SYSTEM1_URL` is running. |
 
 ## Development
 
