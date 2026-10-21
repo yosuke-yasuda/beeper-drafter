@@ -292,7 +292,13 @@ function connect() {
       console.error("ws error:", JSON.stringify(msg));
     }
   };
-  ws.onclose = () => {
+  ws.onclose = async () => {
+    // The WebSocket doesn't say why it closed, so ask over HTTP: a rejected token won't fix itself by retrying.
+    const res = await fetch(`${BASE}/v1/chats?limit=1`, { headers: { Authorization: `Bearer ${TOKEN}` } }).catch(() => null);
+    if (res?.status === 401 || res?.status === 403) {
+      console.error(`Beeper rejected BEEPER_TOKEN (${res.status} ${res.statusText}). Create a new token (see README) and restart.`);
+      process.exit(1);
+    }
     console.error("disconnected from Beeper, retrying in 5s");
     setTimeout(connect, 5000);
   };
