@@ -1,6 +1,18 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { buildPrompt, isCandidate, parseVerdict, PROVIDERS, recentMessages, resolveProvider } from "../lib.mjs";
+import {
+  buildGatePrompt,
+  buildPrompt,
+  buildSystemOneRequest,
+  isCandidate,
+  parseGateVerdict,
+  parseSystemOneAnswer,
+  parseVerdict,
+  PROVIDERS,
+  recentMessages,
+  resolveProvider,
+  resolveSystem1,
+} from "../lib.mjs";
 
 const chat = { id: "!a", title: "Alex", network: "Discord", type: "single", unreadCount: 1 };
 
@@ -105,4 +117,87 @@ test("codex provider omits -m when no model is set, deferring to the CLI default
 test("resolveProvider rejects unknown providers", () => {
   assert.throws(() => resolveProvider({ provider: "gemini" }), /AI_PROVIDER must be one of: claude, codex/);
   assert.deepEqual(Object.keys(PROVIDERS), ["claude", "codex"]);
+});
+
+const msgs = [{ timestamp: "t1", senderName: "Alex", text: "Are you free tomorrow?" }];
+
+test("System 1 is off by default, so the full model judges every chat", () => {
+  assert.equal(resolveSystem1({}), null);
+  assert.equal(resolveSystem1(), null);
+});
+
+test("systemone provider defaults to a local Clef-Flash server", () => {
+  const s1 = resolveSystem1({ SYSTEM1_PROVIDER: "systemone" });
+  assert.equal(s1.kind, "systemone");
+  assert.equal(s1.url, "http://localhost:30000/v1/systemone");
+  assert.equal(s1.model, "Cloudflare/clef-flash");
+  assert.equal(s1.threshold, 0.3);
+  assert.equal(s1.history, 10);
+});
+
+test("SYSTEM1_HISTORY sets how many messages the gate sees, separately from HISTORY", () => {
+  assert.equal(resolveSystem1({ SYSTEM1_PROVIDER: "systemone", SYSTEM1_HISTORY: "5" }).history, 5);
+  for (const bad of ["0", "-1", "2.5", "x"]) {
+    assert.throws(() => resolveSystem1({ SYSTEM1_PROVIDER: "systemone", SYSTEM1_HISTORY: bad }), /SYSTEM1_HISTORY must be a positive integer/, bad);
+  }
+});
+
+test("systemone provider accepts a remote URL, key, and threshold", () => {
+  const s1 = resolveSystem1({ SYSTEM1_PROVIDER: "systemone", SYSTEM1_URL: "https://clef.example.com/", SYSTEM1_API_KEY: "k", SYSTEM1_THRESHOLD: "0.1" });
+  assert.equal(s1.url, "https://clef.example.com/v1/systemone");
+  assert.equal(s1.apiKey, "k");
+  assert.equal(s1.threshold, 0.1);
+});
+
+test("openai provider needs a model and uses the chat completions endpoint", () => {
+  assert.throws(() => resolveSystem1({ SYSTEM1_PROVIDER: "openai" }), /SYSTEM1_MODEL is required/);
+  const s1 = resolveSystem1({ SYSTEM1_PROVIDER: "openai", SYSTEM1_MODEL: "gpt-5-nano", OPENAI_API_KEY: "sk" });
+  assert.equal(s1.url, "https://api.openai.com/v1/chat/completions");
+  assert.equal(s1.apiKey, "sk");
+  const local = resolveSystem1({ SYSTEM1_PROVIDER: "openai", SYSTEM1_MODEL: "clef-flash", SYSTEM1_URL: "http://localhost:11434/v1" });
+  assert.equal(local.url, "http://localhost:11434/v1/chat/completions");
+});
+
+test("CLI System 1 providers use a light model and the gate system prompt", () => {
+  const claude = resolveSystem1({ SYSTEM1_PROVIDER: "claude" });
+  assert.equal(claude.kind, "cli");
+  assert.ok(claude.args.includes("haiku"));
+  assert.ok(claude.args.some((a) => a.includes("triage chat messages")));
+  const codex = resolveSystem1({ SYSTEM1_PROVIDER: "codex", SYSTEM1_MODEL: "gpt-5.4-mini", SYSTEM1_EFFORT: "minimal" });
+  assert.equal(codex.cmd, "codex");
+  assert.ok(codex.args.includes("gpt-5.4-mini"));
+  assert.ok(codex.args.includes("model_reasoning_effort=minimal"));
+});
+
+test("resolveSystem1 rejects unknown providers and bad thresholds", () => {
+  assert.throws(() => resolveSystem1({ SYSTEM1_PROVIDER: "gemini" }), /SYSTEM1_PROVIDER must be one of/);
+  assert.throws(() => resolveSystem1({ SYSTEM1_PROVIDER: "systemone", SYSTEM1_THRESHOLD: "2" }), /between 0 and 1/);
+  assert.throws(() => resolveSystem1({ SYSTEM1_PROVIDER: "systemone", SYSTEM1_THRESHOLD: "x" }), /between 0 and 1/);
+});
+
+test("buildSystemOneRequest asks one yes/no question about the transcript", () => {
+  const req = buildSystemOneRequest("Cloudflare/clef-flash", chat, msgs);
+  assert.equal(req.model, "Cloudflare/clef-flash");
+  assert.match(req.state, /Alex: Are you free tomorrow\?/);
+  assert.equal(req.questions.needs_reply.type, "noul");
+  assert.match(buildGatePrompt(chat, msgs), /"needsReply"/);
+});
+
+test("parseSystemOneAnswer reads the plausible yes/no answer shapes", () => {
+  // Real Clef-Flash response from llama-server.
+  const clef = { model: "ggml-org/Clef-Flash-GGUF:Q4_K_M", answers: { needs_reply: { type: "noul", noul: 0.09569270941000067 } }, usage: { input_tokens: 1568, output_tokens: 0 } };
+  assert.equal(parseSystemOneAnswer(clef), 0.09569270941000067);
+  assert.equal(parseSystemOneAnswer({ answers: { needs_reply: 0.8 } }), 0.8);
+  assert.equal(parseSystemOneAnswer({ answers: { needs_reply: { probability: 0.2 } } }), 0.2);
+  assert.equal(parseSystemOneAnswer({ answers: { needs_reply: { true_probability: 0.4 } } }), 0.4);
+  assert.equal(parseSystemOneAnswer({ answers: { needs_reply: { probabilities: { true: 0.9, false: 0.1 } } } }), 0.9);
+  assert.ok(Math.abs(parseSystemOneAnswer({ answers: { needs_reply: { answer: false, confidence: 0.75 } } }) - 0.25) < 1e-9);
+  assert.throws(() => parseSystemOneAnswer({ answers: {} }), /no needs_reply probability/);
+  assert.throws(() => parseSystemOneAnswer({ answers: { needs_reply: 3 } }), /not a probability/);
+});
+
+test("parseGateVerdict reads a probability or boolean from LLM output", () => {
+  assert.deepEqual(parseGateVerdict('```json\n{"needsReply":0.1,"reason":"just thanks"}\n```'), { probability: 0.1, reason: "just thanks" });
+  assert.equal(parseGateVerdict('{"needsReply":true}').probability, 1);
+  assert.throws(() => parseGateVerdict('{"needsReply":"maybe"}'));
 });

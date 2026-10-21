@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Beeper -> local AI CLI (Claude Code or Codex) -> draft reply back into Beeper.
+// Beeper -> [optional System 1 gate] -> local AI CLI (Claude Code or Codex) -> draft reply back into Beeper.
 // Never sends. Only fills the chat's draft box when it is empty, so you review and hit Enter yourself.
 //
 // Usage (see README):
@@ -11,7 +11,19 @@ import { spawn } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildPrompt, isCandidate, parseVerdict, recentMessages, resolveProvider } from "./lib.mjs";
+import {
+  buildGatePrompt,
+  buildPrompt,
+  buildSystemOneRequest,
+  GATE_SYSTEM_PROMPT,
+  isCandidate,
+  parseGateVerdict,
+  parseSystemOneAnswer,
+  parseVerdict,
+  recentMessages,
+  resolveProvider,
+  resolveSystem1,
+} from "./lib.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const BASE = process.env.BEEPER_URL ?? "http://localhost:23373";
@@ -30,9 +42,10 @@ if (!TOKEN) {
   process.exit(1);
 }
 
-let ai;
+let ai, system1;
 try {
   ai = resolveProvider({ provider: process.env.AI_PROVIDER, model: process.env.AI_MODEL, effort: process.env.AI_EFFORT });
+  system1 = resolveSystem1(process.env);
 } catch (e) {
   console.error(e.message);
   process.exit(1);
@@ -52,27 +65,63 @@ async function api(method, path, body) {
   return res.status === 204 ? null : res.json();
 }
 
-function runModel(prompt) {
+// Runs a provider CLI with the prompt on stdin and resolves with its reply text.
+function runCli(provider, prompt) {
   return new Promise((resolve, reject) => {
-    const p = spawn(ai.cmd, ai.args, { cwd: HERE, stdio: ["pipe", "pipe", "pipe"] });
+    const p = spawn(provider.cmd, provider.args, { cwd: HERE, stdio: ["pipe", "pipe", "pipe"] });
     let out = "", err = "";
     p.stdout.on("data", (d) => (out += d));
     p.stderr.on("data", (d) => (err += d));
-    p.on("error", (e) => reject(new Error(`could not start ${ai.cmd}: ${e.message}`)));
+    p.on("error", (e) => reject(new Error(`could not start ${provider.cmd}: ${e.message}`)));
     p.on("close", (code) => {
       if (code !== 0) {
         // Surface the API's own message (e.g. an unsupported AI_EFFORT for this model) instead of the raw log tail.
         const apiError = err.match(/"message":"([^"]+)"/)?.[1];
-        return reject(new Error(`${ai.cmd} exited ${code}: ${apiError ?? err.slice(-500)}`));
+        return reject(new Error(`${provider.cmd} exited ${code}: ${apiError ?? err.slice(-500)}`));
       }
-      try {
-        resolve(parseVerdict(ai.extractText(out)));
-      } catch {
-        reject(new Error(`could not parse ${ai.cmd} output: ${out.slice(0, 500)}`));
-      }
+      resolve(provider.extractText(out));
     });
     p.stdin.end(prompt);
   });
+}
+
+async function runModel(prompt) {
+  const out = await runCli(ai, prompt);
+  try {
+    return parseVerdict(out);
+  } catch {
+    throw new Error(`could not parse ${ai.cmd} output: ${out.slice(0, 500)}`);
+  }
+}
+
+async function postJson(url, body) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...(system1.apiKey ? { Authorization: `Bearer ${system1.apiKey}` } : {}) },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(system1.timeoutMs),
+  });
+  if (!res.ok) throw new Error(`POST ${url} -> ${res.status} ${(await res.text()).slice(0, 300)}`);
+  return res.json();
+}
+
+// System 1: how likely is it that this chat needs a reply from me? Returns {probability, reason}.
+async function runSystem1(chat, messages) {
+  if (system1.kind === "systemone") {
+    const body = await postJson(system1.url, buildSystemOneRequest(system1.model, chat, messages));
+    return { probability: parseSystemOneAnswer(body), reason: system1.model };
+  }
+  if (system1.kind === "openai") {
+    const body = await postJson(system1.url, {
+      model: system1.model,
+      messages: [
+        { role: "system", content: GATE_SYSTEM_PROMPT },
+        { role: "user", content: buildGatePrompt(chat, messages) },
+      ],
+    });
+    return parseGateVerdict(body.choices?.[0]?.message?.content ?? "");
+  }
+  return parseGateVerdict(await runCli(system1, buildGatePrompt(chat, messages)));
 }
 
 async function handleChat(chat) {
@@ -82,13 +131,26 @@ async function handleChat(chat) {
   if (!last || last.isSender) return;
   if (state[chat.id] === last.sortKey) return; // already considered this message
 
-  const verdict = await runModel(buildPrompt(chat, messages, style));
   const markDone = () => {
     state[chat.id] = last.sortKey;
     saveState();
   };
-
   const tag = `[${chat.network}] ${chat.title}`;
+
+  if (system1) {
+    try {
+      const gate = await runSystem1(chat, messages.slice(-system1.history)); // the gate sees fewer messages, for speed
+      if (gate.probability < system1.threshold) {
+        console.log(`skip1 ${tag} — p=${gate.probability.toFixed(2)} ${gate.reason}`);
+        return markDone();
+      }
+    } catch (e) {
+      // Fail open: a broken or unreachable gate must never cost you a draft.
+      console.error(`system1 error ${tag}: ${e.message} (falling back to the full model)`);
+    }
+  }
+
+  const verdict = await runModel(buildPrompt(chat, messages, style));
   if (!verdict.shouldDraft) {
     console.log(`skip  ${tag} — ${verdict.reason}`);
     return markDone();
@@ -134,7 +196,8 @@ function connect() {
     const msg = JSON.parse(ev.data);
     if (msg.type === "ready") {
       ws.send(JSON.stringify({ type: "subscriptions.set", chatIDs: ["*"] }));
-      console.log(`connected to Beeper, listening for messages (${ai.name}${process.env.AI_EFFORT ? `, effort ${process.env.AI_EFFORT}` : ""})`);
+      const gate = system1 ? `, system1 ${system1.name} < ${system1.threshold} skips` : "";
+      console.log(`connected to Beeper, listening for messages (${ai.name}${process.env.AI_EFFORT ? `, effort ${process.env.AI_EFFORT}` : ""}${gate})`);
       enqueue(reconcile); // catch anything missed while disconnected
     } else if (msg.type === "message.upserted") {
       onNewMessage(msg.chatID);
